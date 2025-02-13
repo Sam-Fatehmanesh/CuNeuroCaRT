@@ -1,0 +1,80 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+.env
+.venv
+env/
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Project-specific
+output/
+registered/
+*.tif
+*.tiff
+*.h5
+*.hdf5
+*.avi
+*.mp4
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# Logs and debugging
+*.log
+.coverage
+htmlcov/
+.pytest_cache/
+.coverage.*
+
+# OS-specific
+.DS_Store
+Thumbs.db
+.directory
+
+# CUDA
+*.ptx
+*.cubin
+*.fatbin
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+
+# Configuration (except example)
+config.yaml
+!example_config.yaml
+
+# Documentation build
+docs/_build/
+docs/_static/
+docs/_templates/ 
