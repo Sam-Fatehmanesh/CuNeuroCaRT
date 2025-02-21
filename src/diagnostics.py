@@ -300,8 +300,13 @@ def generate_comparison_video(volume_data, neuron_data, config):
     neuron_data : dict
         Dictionary containing neuron positions and time series
     config : dict
-        Configuration dictionary
+        Configuration dictionary containing mandatory 'generate_video' parameter
     """
+    # Check if video generation is enabled
+    if not config['diagnostics'].get('generate_video', False):
+        logger.info("Video generation is disabled in config")
+        return
+        
     logger.info("Generating comparison video")
     video = None
     
@@ -357,7 +362,7 @@ def generate_comparison_video(volume_data, neuron_data, config):
         )
         
         batch_size = int(0.5 * total_memory / memory_per_frame)
-        batch_size = max(1, batch_size) 
+        batch_size = max(1, min(batch_size, time_points)) 
         logger.info(f"Processing video in batches of {batch_size} frames")
         
         # Initialize video writer
