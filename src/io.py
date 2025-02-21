@@ -8,50 +8,60 @@ from .utils import gpu_to_cpu, cpu_to_gpu, ensure_gpu_memory
 logger = logging.getLogger(__name__)
 
 def read_tiff(filepath, config):
-    """Read multi-page TIFF file and organize it as a 4D array (time, z, y, x)."""
-    logger.info(f"Reading TIFF file: {filepath}")
-    
+    """Read multi-page TIFF file and organize it as a memory-mapped 4D array (time, z, y, x).
+    Handles both 3D (pages, y, x) and 4D (time, z, y, x) TIFF files."""
+    logger.info(f"Memory mapping TIFF file: {filepath}")
     try:
-        # Read the TIFF file
-        with tifffile.TiffFile(filepath) as tif:
-            # Read all pages into a single array
-            data = tif.asarray()
-            logger.debug(f"Raw data shape: {data.shape}")
+        # Create a memory map (read-only) of the TIFF
+        mem = tifffile.memmap(filepath, mode='r')
+        
+        # Check if file is already 4D
+        if len(mem.shape) == 4:
+            logger.info(f"Found 4D TIFF with shape: {mem.shape}")
+            volume_data = mem
+        else:
+            total_pages = mem.shape[0]
             
-            # Handle different dimension cases
-            if len(data.shape) == 3:  # (pages, height, width)
-                # Check if this is raw input data or already processed data
-                if str(filepath).endswith('registered.tif'):
-                    # This is already processed data, just return as is
-                    logger.info(f"Loading pre-processed volume with shape: {data.shape}")
-                    return data
-                else:
-                    # This is raw input data, reshape according to config
-                    z_slices = config['input']['z_slices_per_volume']
-                    total_pages = data.shape[0]
-                    time_points = total_pages // z_slices
-                    height, width = data.shape[1:]
-                    volume_data = data.reshape(time_points, z_slices, height, width)
-            elif len(data.shape) == 4:  # Already in (time, z, y, x) format
-                logger.info("Data already in correct 4D format")
-                volume_data = data
-            else:
-                raise ValueError(f"Unexpected TIFF dimensions: {data.shape}")
+            # Get the shape of a single page
+            page_shape = mem.shape[1:]
+            logger.info(f"Found 3D TIFF with shape: {mem.shape} | Single page shape: {page_shape}")
             
-            logger.info(f"Loaded volume with shape: {volume_data.shape}")
+            # Get dimensions from config
+            z_slices = config['input']['z_slices_per_volume']
+            time_points = config['input'].get('time_points_per_volume', total_pages // z_slices)
             
-            # Check GPU memory and transfer if possible
-            if ensure_gpu_memory(volume_data.shape, volume_data.dtype):
-                volume_data = cpu_to_gpu(volume_data)
+            expected_pages = time_points * z_slices
+            if total_pages != expected_pages:
+                logger.warning(f"Total pages ({total_pages}) does not match expected pages "
+                             f"(time_points {time_points} * z_slices {z_slices} = {expected_pages})")
             
-            return volume_data
+            # Reshape the memmap to 4D: (time, z, y, x)
+            volume_data = mem.reshape((time_points, z_slices) + page_shape)
             
+        logger.info(f"Final volume shape: {volume_data.shape}, dtype: {volume_data.dtype}")
+        return volume_data  # Returns a numpy memmap array
+                
     except Exception as e:
-        logger.error(f"Error reading TIFF file: {str(e)}")
+        logger.error(f"Error memory-mapping TIFF file: {str(e)}")
         logger.error(f"File path: {filepath}")
-        if 'data' in locals():
-            logger.error(f"Data shape: {data.shape}")
         raise
+
+def read_chunk(volume_data, t_start, t_end, z_start, z_end):
+    """Return a chunk from the memory-mapped volume data.
+    
+    Parameters
+    ----------
+    volume_data : numpy.memmap
+        Memory-mapped 4D array (time, z, y, x)
+    t_start, t_end : int
+        Start and end time points
+    z_start, z_end : int
+        Start and end z-planes
+    """
+    # Simple slicing of the memmap - only loads requested chunk into memory
+    chunk = volume_data[t_start:t_end, z_start:z_end]
+    logger.debug(f"Read chunk with shape: {chunk.shape}")
+    return chunk
 
 def write_results(neuron_data, config):
     """Write neuron detection and time series results to HDF5 file."""

@@ -2,6 +2,7 @@ import cupy as cp
 import numpy as np
 import logging
 from .utils import gpu_to_cpu, cpu_to_gpu
+from .io import read_chunk
 from pathlib import Path
 import faulthandler
 import signal
@@ -128,77 +129,104 @@ def process_chunk(chunk, mean_frame, max_shift):
     # logger.debug(f"Registered chunk shape: {registered_chunk.shape}")
     return registered_chunk
 
-def register_volume(volume, config):
-    """Register 4D volume using phase correlation with chunked processing."""
+def register_volume(volume_data, config):
+    """Register 4D volume using phase correlation with batched processing."""
     logger.info("Starting volume registration")
-    logger.debug(f"Input volume shape: {volume.shape}")
     
     # Get parameters
     max_shift = config['registration']['max_shift']
     output_dir = Path(config['output']['base_dir']) / config['output']['registered_dir']
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    time_points, z_slices, height, width = volume.shape
+    # Get shape and dtype from volume_data (now a memmap array)
+    time_points, z_slices, height, width = volume_data.shape
+    dtype = volume_data.dtype
     
-    # Determine if input is on GPU
-    is_gpu_input = isinstance(volume, cp.ndarray)
-    logger.debug(f"Input volume is on GPU: {is_gpu_input}")
-    
-    # Create output array on CPU to avoid memory issues
-    registered = np.zeros_like(gpu_to_cpu(volume) if is_gpu_input else volume)
+    # Create output array on CPU
+    registered = np.zeros_like(volume_data)
     logger.debug(f"Created output array with shape: {registered.shape}")
     
     try:
-        # Calculate chunk size based on available GPU memory
-        total_memory = cp.cuda.runtime.memGetInfo()[1]
-        bytes_per_pixel = np.dtype(volume.dtype).itemsize
-        pixels_per_frame = height * width
+        # Calculate optimal chunk size based on available GPU memory
+        free_memory = cp.cuda.runtime.memGetInfo()[0]
+        bytes_per_pixel = np.dtype(dtype).itemsize
         
-        memory_per_frame = bytes_per_pixel * pixels_per_frame * 4  # 4x for processing overhead
-        chunk_size = int(0.9 * total_memory / memory_per_frame)
-        chunk_size = max(1, min(chunk_size, 50))
+        # Memory needed per frame:
+        # 1. Input frame
+        # 2. FFT of frame (complex64)
+        # 3. Correlation surface
+        # 4. Output frame
+        # Plus overhead for intermediate computations
+        memory_per_frame = bytes_per_pixel * (
+            height * width +  # Input frame
+            height * width * 2 +  # Complex FFT
+            height * width +  # Correlation surface
+            height * width +  # Output frame
+            height * width * 2  # Overhead
+        )
         
-        logger.info(f"Processing in chunks of {chunk_size} time points")
+        # Use 80% of available memory for safety
+        chunk_size = int(0.8 * free_memory / memory_per_frame)
+        chunk_size = max(1, min(chunk_size, time_points))  # Ensure valid chunk size
+        logger.info(f"Processing in chunks of {chunk_size} frames")
         
         # Process z-planes
         for z in range(z_slices):
             logger.info(f"Processing z-plane {z}/{z_slices}")
             
-            # Compute mean frame for this z-plane
-            z_plane_data = volume[:, z, :, :]
-            if not is_gpu_input:
-                z_plane_data = cpu_to_gpu(z_plane_data)
+            # Initialize mean frame computation
+            mean_frame = None
+            frames_processed = 0
             
-            mean_frame = cp.mean(z_plane_data, axis=0)
-            logger.debug(f"Mean frame shape: {mean_frame.shape}")
+            # Process time points in chunks to compute mean frame
+            for t_start in range(0, time_points, chunk_size):
+                t_end = min(t_start + chunk_size, time_points)
+                
+                # Get chunk data directly from memmap
+                chunk_data = volume_data[t_start:t_end, z]
+                
+                # Move to GPU and convert to float32 for computations
+                chunk_gpu = cp.asarray(chunk_data, dtype=cp.float32)
+                
+                # Update mean frame
+                if mean_frame is None:
+                    mean_frame = cp.sum(chunk_gpu, axis=0, dtype=cp.float32)
+                else:
+                    mean_frame += cp.sum(chunk_gpu, axis=0, dtype=cp.float32)
+                frames_processed += len(chunk_gpu)
+                
+                # Clear GPU memory
+                del chunk_gpu
+                cp.get_default_memory_pool().free_all_blocks()
             
-            # Process time points in chunks
+            # Finalize mean frame
+            mean_frame = mean_frame / float(frames_processed)  # Explicit float division
+            
+            # Process chunks for registration
             for t_start in range(0, time_points, chunk_size):
                 t_end = min(t_start + chunk_size, time_points)
                 logger.debug(f"Processing time points {t_start} to {t_end}")
                 
-                # Extract and process chunk
-                chunk_data = z_plane_data[t_start:t_end]
-                if not is_gpu_input:
-                    chunk_data = cpu_to_gpu(chunk_data)
+                # Get chunk data directly from memmap
+                chunk_data = volume_data[t_start:t_end, z]
                 
-                registered_chunk = process_chunk(chunk_data, mean_frame, max_shift)
-                logger.debug(f"Registered chunk shape: {registered_chunk.shape}")
+                # Process chunk
+                chunk_gpu = cp.asarray(chunk_data, dtype=cp.float32)  # Convert to float32
+                registered_chunk = process_chunk(chunk_gpu, mean_frame, max_shift)
                 
-                # Store results (always convert to CPU for storage)
-                logger.debug(f"Storing at indices [{t_start}:{t_end}, {z}, :, :]")
-                registered_chunk_cpu = gpu_to_cpu(registered_chunk)
-                registered[t_start:t_end, z, :, :] = registered_chunk_cpu
+                # Store results
+                registered[t_start:t_end, z] = gpu_to_cpu(registered_chunk.astype(dtype))  # Convert back to original dtype
                 
                 # Clear GPU memory
-                del chunk_data, registered_chunk
+                del chunk_gpu, registered_chunk
                 cp.get_default_memory_pool().free_all_blocks()
             
             # Clear GPU memory for this z-plane
-            if not is_gpu_input:
-                del z_plane_data
             del mean_frame
             cp.get_default_memory_pool().free_all_blocks()
+            
+            # Log progress
+            logger.info(f"Completed z-plane {z+1}/{z_slices}")
         
         logger.info("Registration complete")
         return registered

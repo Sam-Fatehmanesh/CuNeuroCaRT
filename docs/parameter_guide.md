@@ -9,22 +9,24 @@ This document provides detailed information about each configuration parameter a
 input:
   tiff_file: "/path/to/data.tif"
   z_slices_per_volume: 10
-  time_points_per_volume: 768
+  # time_points_per_volume is optional
 ```
 
 - **tiff_file**: Path to input TIFF stack
-  - Must be a 4D TIFF file (time, z, y, x)
+  - Must be a multi-page TIFF file
   - Typically raw calcium imaging data
-  - File size = time_points × z_slices × height × width × bytes_per_pixel
+  - File size = total_pages × height × width × bytes_per_pixel
 
 - **z_slices_per_volume**: Number of z-planes in each volume
   - Must match your microscopy setup
   - Affects memory usage and processing time
-  - Total TIFF pages should be z_slices × time_points
+  - Used to reshape raw pages into 4D volumes
 
-- **time_points_per_volume**: Number of time points
-  - Total frames divided by z_slices
-  - Affects processing time and memory requirements
+- **time_points_per_volume**: (Optional) Number of time points
+  - Automatically calculated as: total_tiff_pages / z_slices_per_volume
+  - Only specify if automatic calculation needs to be overridden
+  - Example use case: when TIFF contains extra pages (calibration frames, metadata)
+  - If provided, a warning will be logged if it differs from the calculated value
 
 ### Output Settings
 ```yaml
@@ -166,6 +168,44 @@ gpu:
   - Lower: safer, leaves memory for system
   - Recommended: 0.8 - 0.95
 
+## Spike Detection Parameters
+
+```yaml
+spike_detection:
+  decay_constant: 0.95
+  minimum_spike: 0.1
+  lambda: null
+  noise_std: 0.1
+```
+
+- **decay_constant**: Calcium decay time constant (g)
+  - Range: 0.8 to 0.98
+  - Controls calcium signal decay rate
+  - Higher values: slower decay
+  - Lower values: faster decay
+  - Typical values: 0.95-0.97
+
+- **minimum_spike**: Minimum spike amplitude
+  - Range: 0.05 to 0.5
+  - Threshold for spike detection
+  - Set to null to use L1 penalty instead
+  - Higher values: fewer false positives
+  - Lower values: more sensitive detection
+
+- **lambda**: L1 sparsity penalty
+  - Range: null or 0.0 to 10.0
+  - Controls spike train sparsity
+  - null: auto-optimize using noise_std
+  - Higher values: sparser solutions
+  - Lower values: more spikes detected
+
+- **noise_std**: Noise standard deviation
+  - Range: 0.01 to 0.5
+  - Used for lambda optimization
+  - Estimate from quiet periods
+  - Higher values: more regularization
+  - Lower values: less regularization
+
 ## Parameter Tuning Guide
 
 ### For Weak Signals
@@ -201,4 +241,40 @@ registration:
 registration:
   max_shift: 30
   phase_correlation_threshold: 0.2
+```
+
+### For Noisy Data
+```yaml
+spike_detection:
+  decay_constant: 0.97
+  minimum_spike: 0.2
+  lambda: null
+  noise_std: 0.2
+```
+
+### For Clean Data
+```yaml
+spike_detection:
+  decay_constant: 0.95
+  minimum_spike: 0.08
+  lambda: null
+  noise_std: 0.05
+```
+
+### For Fast Events
+```yaml
+spike_detection:
+  decay_constant: 0.9
+  minimum_spike: 0.15
+  lambda: null
+  noise_std: 0.1
+```
+
+### For Slow Events
+```yaml
+spike_detection:
+  decay_constant: 0.98
+  minimum_spike: 0.1
+  lambda: null
+  noise_std: 0.1
 ``` 

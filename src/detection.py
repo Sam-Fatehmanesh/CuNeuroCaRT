@@ -5,6 +5,8 @@ import logging
 import triton
 import triton.language as tl
 from .utils import gpu_to_cpu, cpu_to_gpu
+from pathlib import Path
+import cv2
 
 logger = logging.getLogger(__name__)
 
@@ -88,127 +90,154 @@ def compute_local_contrast(image, radius):
     logger.debug("Local contrast computation completed")
     return contrast
 
-def detect_neurons(volume, config):
-    """Detect neurons in the registered volume."""
+def detect_neurons(volume_data, config):
+    """Detect neurons in a 4D volume using local contrast and thresholding."""
     logger.info("Starting neuron detection")
     
-    # Get parameters
-    contrast_radius = config['detection']['local_contrast_radius']
-    brightness_threshold = config['detection']['brightness_threshold']
-    min_area = config['detection']['min_neuron_area']
-    max_area = config['detection']['max_neuron_area']
+    # Get parameters from config with defaults
+    detection_config = config.get('detection', {})
+    output_config = config.get('output', {})
     
-    time_points, z_slices, height, width = volume.shape
+    # Detection parameters with defaults
+    local_contrast_radius = detection_config.get('local_contrast_radius', 2)
+    brightness_threshold = detection_config.get('brightness_threshold', 60)
+    min_size = detection_config.get('min_neuron_area', 2)
+    max_size = detection_config.get('max_neuron_area', 100)
     
-    # Store detected neuron information
-    neurons = []
+    # Output directory setup
+    base_dir = Path(output_config.get('base_dir', 'output'))
+    detection_dir = output_config.get('detection_dir', 'detection')
+    output_dir = base_dir / detection_dir
+    
+    # Log parameters
+    logger.info(f"Detection parameters:")
+    logger.info(f"  Local contrast radius: {local_contrast_radius}")
+    logger.info(f"  Brightness threshold: {brightness_threshold}")
+    logger.info(f"  Min neuron area: {min_size}")
+    logger.info(f"  Max neuron area: {max_size}")
+    logger.info(f"  Output directory: {output_dir}")
+    
+    # Create output directory
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Get shape and dtype from volume_data
+    time_points, z_slices, height, width = volume_data.shape
+    dtype = volume_data.dtype
+    
+    # Initialize results array
+    neuron_locations = []
     
     try:
-        # Calculate chunk size based on available GPU memory
-        total_memory = cp.cuda.runtime.memGetInfo()[1]
-        bytes_per_pixel = np.dtype(volume.dtype).itemsize
-        pixels_per_frame = height * width * z_slices
+        # Calculate optimal chunk size based on available GPU memory
+        free_memory = cp.cuda.runtime.memGetInfo()[0]
+        bytes_per_pixel = np.dtype(dtype).itemsize
         
-        # Account for GPU memory needed for processing:
-        # 1. Input chunk
-        # 2. Mean computation
-        # 3. Local contrast computation (includes padded array)
-        # 4. Binary mask
-        memory_per_frame = bytes_per_pixel * pixels_per_frame * 4  # 4x for processing overhead
-        chunk_size = int(0.9 * total_memory / memory_per_frame)  # Use 90% of available memory
+        # Memory needed per frame:
+        # 1. Input frame
+        # 2. Local contrast computation
+        # 3. Binary mask
+        # 4. Connected components
+        # Plus overhead for intermediate computations
+        memory_per_frame = bytes_per_pixel * (
+            height * width +  # Input frame
+            height * width * 2 +  # Local contrast (float32)
+            height * width +  # Binary mask
+            height * width +  # Connected components
+            height * width * 2  # Overhead
+        )
+        
+        # Use 80% of available memory for safety
+        chunk_size = int(0.8 * free_memory / memory_per_frame)
         chunk_size = max(1, min(chunk_size, time_points))  # Ensure valid chunk size
+        logger.info(f"Processing in chunks of {chunk_size} frames")
         
-        logger.info(f"Processing in chunks of {chunk_size} time points")
-        
-        # Initialize mean volume
-        mean_volume = np.zeros((z_slices, height, width), dtype=np.float32)
-        
-        logger.info("Computing mean volume in chunks")
-        for t_start in range(0, time_points, chunk_size):
-            t_end = min(t_start + chunk_size, time_points)
-            chunk = volume[t_start:t_end]
+        # Process z-planes
+        for z in range(z_slices):
+            logger.info(f"Processing z-plane {z}/{z_slices}")
             
-            # Process chunk on GPU
-            with cp.cuda.Device(0):
-                # Move chunk to GPU and compute mean
-                chunk_gpu = cpu_to_gpu(chunk)
-                chunk_mean = cp.mean(chunk_gpu, axis=0)
-                mean_volume += gpu_to_cpu(chunk_mean) * (t_end - t_start) / time_points
-                
-                # Clear GPU memory immediately
-                del chunk_gpu, chunk_mean
-                cp.get_default_memory_pool().free_all_blocks()
-        
-        logger.info("Processing each z-plane")
-        # Calculate z-plane batch size based on remaining GPU memory
-        total_memory = cp.cuda.runtime.memGetInfo()[1]
-        memory_per_zplane = bytes_per_pixel * height * width * 4  # 4x for processing overhead
-        z_batch_size = int(0.9 * total_memory / memory_per_zplane)  # Use 20% of available memory
-        z_batch_size = max(1, min(z_batch_size, z_slices))
-        
-        logger.info(f"Processing z-planes in batches of {z_batch_size}")
-        
-        for z_start in range(0, z_slices, z_batch_size):
-            z_end = min(z_start + z_batch_size, z_slices)
-            logger.info(f"Processing z-planes {z_start} to {z_end-1}")
+            # Initialize mean frame computation
+            mean_frame = None
+            frames_processed = 0
             
-            for z in range(z_start, z_end):
-                # Move mean image for this z-plane to GPU
-                mean_image = cpu_to_gpu(mean_volume[z])
+            # Process time points in chunks to compute mean frame
+            for t_start in range(0, time_points, chunk_size):
+                t_end = min(t_start + chunk_size, time_points)
                 
-                # Compute local contrast
-                contrast = compute_local_contrast(mean_image, contrast_radius)
+                # Get chunk data directly from memmap
+                chunk_data = volume_data[t_start:t_end, z]
                 
-                # Threshold the contrast image
-                binary = (contrast > brightness_threshold) & (mean_image > brightness_threshold)
+                # Move to GPU and convert to float32 for computations
+                chunk_gpu = cp.asarray(chunk_data, dtype=cp.float32)
                 
-                # Convert to CPU for connected component analysis
-                binary_cpu = gpu_to_cpu(binary)
+                # Update mean frame
+                if mean_frame is None:
+                    mean_frame = cp.sum(chunk_gpu, axis=0, dtype=cp.float32)
+                else:
+                    mean_frame += cp.sum(chunk_gpu, axis=0, dtype=cp.float32)
+                frames_processed += len(chunk_gpu)
                 
                 # Clear GPU memory
-                del mean_image, contrast, binary
+                del chunk_gpu
                 cp.get_default_memory_pool().free_all_blocks()
-                
-                # Find connected components
-                labels = measure.label(binary_cpu)
-                regions = measure.regionprops(labels)
-                
-                # Filter regions by area and store neuron information
-                for region in regions:
-                    if min_area <= region.area <= max_area:
-                        y, x = region.centroid
-                        neurons.append({
-                            'z': z,
-                            'y': y,
-                            'x': x,
-                            'area': region.area
-                        })
-                
-                # Clear CPU memory
-                del binary_cpu, labels, regions
+            
+            # Finalize mean frame
+            mean_frame = mean_frame / float(frames_processed)  # Explicit float division
+            
+            # Normalize mean frame to [0, 255] range for consistent thresholding
+            mean_min = cp.min(mean_frame)
+            mean_max = cp.max(mean_frame)
+            if mean_max > mean_min:
+                mean_frame = ((mean_frame - mean_min) * (255.0 / (mean_max - mean_min))).astype(cp.float32)
+            
+            # Compute local contrast
+            local_contrast = compute_local_contrast(mean_frame, local_contrast_radius)
+            
+            # Normalize local contrast to [0, 255] range
+            contrast_min = cp.min(local_contrast)
+            contrast_max = cp.max(local_contrast)
+            if contrast_max > contrast_min:
+                local_contrast = ((local_contrast - contrast_min) * (255.0 / (contrast_max - contrast_min))).astype(cp.float32)
+            
+            # Apply threshold and convert to uint8
+            binary_mask = (local_contrast > brightness_threshold).astype(cp.uint8)
+            
+            # Find connected components
+            binary_mask_cpu = cp.asnumpy(binary_mask)
+            num_features, labels, stats, centroids = cv2.connectedComponentsWithStats(binary_mask_cpu)
+            
+            # Filter components by size and store locations
+            for i in range(1, num_features):  # Skip background (label 0)
+                area = stats[i, cv2.CC_STAT_AREA]
+                if min_size <= area <= max_size:  # Apply both min and max size filters
+                    neuron_locations.append({
+                        'z': z,
+                        'y': centroids[i][1],
+                        'x': centroids[i][0],
+                        'size': area
+                    })
+            
+            # Clear GPU memory
+            del mean_frame, local_contrast, binary_mask
+            cp.get_default_memory_pool().free_all_blocks()
             
             # Log progress
-            logger.info(f"Found {len(neurons)} neurons so far")
-            
-            # Force garbage collection
-            import gc
-            gc.collect()
+            logger.info(f"Found {len(neuron_locations)} neurons in z-plane {z+1}/{z_slices}")
         
-        n_neurons = len(neurons)
-        logger.info(f"Detected {n_neurons} neurons")
+        # Save neuron locations to file
+        locations_file = output_dir / "neuron_locations.npy"
+        np.save(locations_file, np.array([[n['z'], n['y'], n['x']] for n in neuron_locations]))
+        logger.info(f"Saved neuron locations to {locations_file}")
         
-        if n_neurons == 0:
-            logger.warning("No neurons detected! Check detection parameters in config.")
-            return {'positions': np.array([]), 'metadata': []}
-        
-        # Convert to numpy arrays for easier handling
-        positions = np.array([[n['z'], n['y'], n['x']] for n in neurons])
-        
+        logger.info(f"Detection complete. Found {len(neuron_locations)} total neurons")
         return {
-            'positions': positions,
-            'metadata': neurons
+            'positions': np.array([[n['z'], n['y'], n['x']] for n in neuron_locations]),
+            'metadata': neuron_locations
         }
-        
+            
+    except KeyboardInterrupt:
+        logger.warning("Detection interrupted by user")
+        logger.info("Preserving temporary files for recovery")
+        raise
     except Exception as e:
-        logger.error(f"Error during neuron detection: {str(e)}")
+        logger.error(f"Error during detection: {str(e)}")
         raise 

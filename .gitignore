@@ -78,3 +78,7 @@ config.yaml
 docs/_build/
 docs/_static/
 docs/_templates/ 
+
+__pycache__
+
+*.txt

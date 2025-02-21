@@ -5,59 +5,303 @@ import logging
 from pathlib import Path
 from .utils import gpu_to_cpu, ensure_gpu_memory
 import subprocess
+import h5py
+import tifffile
 
 logger = logging.getLogger(__name__)
 
-def normalize_frame(frame):
-    """Normalize frame to 0-255 range for video."""
-    frame_min = frame.min()
-    frame_max = frame.max()
-    if frame_max > frame_min:
-        frame = 255 * (frame - frame_min) / (frame_max - frame_min)
-    return frame.astype(np.uint8)
+def normalize_frames_batch(frames):
+    """Normalize a batch of frames to 0-255 range on GPU."""
+    # Compute min/max across spatial dimensions but keep batch dimension
+    frame_min = cp.min(frames, axis=(1, 2), keepdims=True)
+    frame_max = cp.max(frames, axis=(1, 2), keepdims=True)
+    
+    # Avoid division by zero
+    denominator = frame_max - frame_min
+    denominator = cp.maximum(denominator, 1e-10)
+    
+    # Normalize to [0, 255]
+    frames_norm = 255 * (frames - frame_min) / denominator
+    return frames_norm.astype(cp.uint8)
 
-def create_neuron_frame(positions, time_series, t, shape, z_plane):
-    """Create a frame showing neuron activities at time t."""
+def create_gaussian_kernel(radius, sigma=1.0, sharp=False):
+    """Create a Gaussian kernel on GPU."""
+    size = 2 * radius + 1
+    y, x = cp.ogrid[-radius:radius+1, -radius:radius+1]
+    if sharp:
+        # Sharper falloff for spikes
+        kernel = cp.exp(-(x*x + y*y) / (2 * (sigma/2)**2))
+    else:
+        kernel = cp.exp(-(x*x + y*y) / (2 * sigma**2))
+    return kernel.astype(cp.float32)
+
+def create_neuron_frames_batch(positions, time_series, t_start, t_end, shape, z_plane):
+    """Create frames showing neuron activities for a batch of time points using vectorized operations."""
     height, width = shape
-    frame = np.zeros((height, width), dtype=np.float32)
+    batch_size = t_end - t_start
     
-    # For each neuron in this z-plane
-    for i, (z, y, x) in enumerate(positions):
-        if int(z) == z_plane:
-            # Get intensity from time series and normalize it
-            raw_intensity = time_series[i, t]
-            # Get the full time series for this neuron for normalization
-            neuron_series = time_series[i, :]
-            min_intensity = np.min(neuron_series)
-            max_intensity = np.max(neuron_series)
-            
-            # Normalize intensity to [0, 1] range
-            if max_intensity > min_intensity:
-                intensity = (raw_intensity - min_intensity) / (max_intensity - min_intensity)
-            else:
-                intensity = 0
-            
-            # Scale to make it more visible
-            intensity = intensity * 255
-            
-            # Draw a Gaussian spot at neuron location
-            y, x = int(y), int(x)
-            radius = 2
-            for dy in range(-radius, radius + 1):
-                for dx in range(-radius, radius + 1):
-                    yy = y + dy
-                    xx = x + dx
-                    if 0 <= yy < height and 0 <= xx < width:
-                        # Create a Gaussian falloff from center
-                        dist = np.sqrt(dy**2 + dx**2)
-                        if dist <= radius:
-                            gaussian_factor = np.exp(-(dist**2) / (2 * (radius/2)**2))
-                            frame[yy, xx] = max(frame[yy, xx], intensity * gaussian_factor)
+    # Filter neurons in this z-plane
+    z_mask = positions[:, 0] == z_plane
+    if not cp.any(z_mask):
+        return cp.zeros((batch_size, height, width), dtype=cp.float32)
     
-    return frame
+    plane_positions = positions[z_mask]
+    plane_series = time_series[z_mask]
+    n_neurons = len(plane_positions)
+    
+    # Get and normalize intensities for all neurons across the batch
+    raw_intensities = plane_series[:, t_start:t_end]  # shape: (n_neurons, batch_size)
+    series_min = cp.min(plane_series, axis=1, keepdims=True)
+    series_max = cp.max(plane_series, axis=1, keepdims=True)
+    denominator = cp.maximum(series_max - series_min, 1e-10)
+    intensities = 255 * (raw_intensities - series_min) / denominator  # shape: (n_neurons, batch_size)
+    
+    # Precompute Gaussian kernel
+    radius = 2
+    kernel = create_gaussian_kernel(radius, sigma=1.0, sharp=False)  # shape: (kernel_size, kernel_size)
+    kernel_size = 2 * radius + 1
+    
+    # Get neuron positions
+    y_pos = plane_positions[:, 1].astype(cp.int32)  # shape: (n_neurons,)
+    x_pos = plane_positions[:, 2].astype(cp.int32)  # shape: (n_neurons,)
+    
+    # Create position indices for the kernel around each neuron
+    y_indices = cp.arange(-radius, radius + 1)  # shape: (kernel_size,)
+    x_indices = cp.arange(-radius, radius + 1)  # shape: (kernel_size,)
+    
+    # Create meshgrid for kernel positions
+    Y_kernel, X_kernel = cp.meshgrid(y_indices, x_indices, indexing='ij')
+    
+    # Expand dimensions for broadcasting
+    # Shape transformations for vectorized operations:
+    # y_pos: (n_neurons, 1, 1, 1) - for broadcasting across kernel positions and batch
+    # intensities: (n_neurons, batch_size, 1, 1) - for broadcasting across kernel positions
+    # Y_kernel: (1, 1, kernel_size, kernel_size) - for broadcasting across neurons and batch
+    y_pos = y_pos.reshape(-1, 1, 1, 1)  # (n_neurons, 1, 1, 1)
+    x_pos = x_pos.reshape(-1, 1, 1, 1)  # (n_neurons, 1, 1, 1)
+    intensities = intensities.reshape(n_neurons, batch_size, 1, 1)  # (n_neurons, batch_size, 1, 1)
+    kernel = kernel.reshape(1, 1, kernel_size, kernel_size)  # (1, 1, kernel_size, kernel_size)
+    
+    # Calculate all Y, X positions for all neurons at once
+    Y = y_pos + Y_kernel.reshape(1, 1, kernel_size, kernel_size)  # (n_neurons, 1, kernel_size, kernel_size)
+    X = x_pos + X_kernel.reshape(1, 1, kernel_size, kernel_size)  # (n_neurons, 1, kernel_size, kernel_size)
+    
+    # Create valid mask
+    valid = (Y >= 0) & (Y < height) & (X >= 0) & (X < width)  # (n_neurons, 1, kernel_size, kernel_size)
+    
+    # Initialize output frames
+    frames = cp.zeros((batch_size, height, width), dtype=cp.float32)
+    
+    # Calculate contributions for all neurons and all frames at once
+    kernel_values = kernel * intensities  # (n_neurons, batch_size, kernel_size, kernel_size)
+    
+    # Apply mask
+    kernel_values = cp.where(valid, kernel_values, 0)
+    
+    # Reshape coordinates and values for scatter_add
+    valid_mask = valid.reshape(n_neurons, -1)  # (n_neurons, kernel_size * kernel_size)
+    Y_flat = Y.reshape(n_neurons, -1)  # (n_neurons, kernel_size * kernel_size)
+    X_flat = X.reshape(n_neurons, -1)  # (n_neurons, kernel_size * kernel_size)
+    kernel_values = kernel_values.reshape(n_neurons, batch_size, -1)  # (n_neurons, batch_size, kernel_size * kernel_size)
+    
+    # For each frame in batch (still needed but much more efficient now)
+    for b in range(batch_size):
+        # Get all valid positions and values for this frame
+        frame_values = kernel_values[:, b]  # (n_neurons, kernel_size * kernel_size)
+        
+        # Get valid indices
+        valid_indices = valid_mask
+        Y_valid = Y_flat[valid_indices]
+        X_valid = X_flat[valid_indices]
+        values_valid = frame_values[valid_indices]
+        
+        # Add all contributions at once
+        frames[b].scatter_add((Y_valid, X_valid), values_valid)
+    
+    return frames
 
-def generate_comparison_video(volume, neuron_data, config):
-    """Generate side-by-side comparison video of original vs. reconstructed data."""
+def create_spike_frames_batch(positions, spikes, t_start, t_end, shape, z_plane):
+    """Create frames showing spikes for a batch of time points using vectorized operations."""
+    height, width = shape
+    batch_size = t_end - t_start
+    
+    # Filter neurons in this z-plane
+    z_mask = positions[:, 0] == z_plane
+    if not cp.any(z_mask):
+        return cp.zeros((batch_size, height, width), dtype=cp.float32)
+    
+    plane_positions = positions[z_mask]
+    plane_spikes = spikes[z_mask, t_start:t_end]  # shape: (n_neurons, batch_size)
+    n_neurons = len(plane_positions)
+    
+    # Precompute spike kernel (sharper than neuron kernel)
+    radius = 3
+    kernel = create_gaussian_kernel(radius, sigma=1.0, sharp=True)  # shape: (kernel_size, kernel_size)
+    kernel_size = 2 * radius + 1
+    
+    # Get neuron positions
+    y_pos = plane_positions[:, 1].astype(cp.int32)  # shape: (n_neurons,)
+    x_pos = plane_positions[:, 2].astype(cp.int32)  # shape: (n_neurons,)
+    
+    # Create position indices for the kernel around each neuron
+    y_indices = cp.arange(-radius, radius + 1)  # shape: (kernel_size,)
+    x_indices = cp.arange(-radius, radius + 1)  # shape: (kernel_size,)
+    
+    # Create meshgrid for kernel positions
+    Y_kernel, X_kernel = cp.meshgrid(y_indices, x_indices, indexing='ij')
+    
+    # Expand dimensions for broadcasting
+    y_pos = y_pos.reshape(-1, 1, 1, 1)  # (n_neurons, 1, 1, 1)
+    x_pos = x_pos.reshape(-1, 1, 1, 1)  # (n_neurons, 1, 1, 1)
+    plane_spikes = plane_spikes.reshape(n_neurons, batch_size, 1, 1)  # (n_neurons, batch_size, 1, 1)
+    kernel = kernel.reshape(1, 1, kernel_size, kernel_size)  # (1, 1, kernel_size, kernel_size)
+    
+    # Calculate all Y, X positions for all neurons at once
+    Y = y_pos + Y_kernel.reshape(1, 1, kernel_size, kernel_size)  # (n_neurons, 1, kernel_size, kernel_size)
+    X = x_pos + X_kernel.reshape(1, 1, kernel_size, kernel_size)  # (n_neurons, 1, kernel_size, kernel_size)
+    
+    # Create valid mask
+    valid = (Y >= 0) & (Y < height) & (X >= 0) & (X < width)  # (n_neurons, 1, kernel_size, kernel_size)
+    
+    # Initialize output frames
+    frames = cp.zeros((batch_size, height, width), dtype=cp.float32)
+    
+    # Calculate contributions for all neurons and all frames at once
+    # Multiply by 255 for full intensity where spikes occur
+    kernel_values = kernel * (plane_spikes > 0).astype(cp.float32) * 255  # (n_neurons, batch_size, kernel_size, kernel_size)
+    
+    # Apply mask
+    kernel_values = cp.where(valid, kernel_values, 0)
+    
+    # Reshape coordinates and values for scatter_add
+    valid_mask = valid.reshape(n_neurons, -1)  # (n_neurons, kernel_size * kernel_size)
+    Y_flat = Y.reshape(n_neurons, -1)  # (n_neurons, kernel_size * kernel_size)
+    X_flat = X.reshape(n_neurons, -1)  # (n_neurons, kernel_size * kernel_size)
+    kernel_values = kernel_values.reshape(n_neurons, batch_size, -1)  # (n_neurons, batch_size, kernel_size * kernel_size)
+    
+    # For each frame in batch (still needed but much more efficient now)
+    for b in range(batch_size):
+        # Get all valid positions and values for this frame
+        frame_values = kernel_values[:, b]  # (n_neurons, kernel_size * kernel_size)
+        
+        # Get valid indices
+        valid_indices = valid_mask & (frame_values > 0).reshape(valid_mask.shape)
+        Y_valid = Y_flat[valid_indices]
+        X_valid = X_flat[valid_indices]
+        values_valid = frame_values[valid_indices]
+        
+        # Add all contributions at once
+        frames[b].scatter_add((Y_valid, X_valid), values_valid)
+    
+    return frames
+
+def process_video_batch(original_batch, neuron_data, spikes, t_start, t_end, z_plane, video_writer):
+    """Process a batch of frames for video generation."""
+    batch_size, height, width = original_batch.shape
+    
+    # Move batch to GPU and normalize
+    original_gpu = cp.asarray(original_batch)
+    original_norm = normalize_frames_batch(original_gpu)
+    
+    # Create neuron visualization frames
+    neuron_frames = create_neuron_frames_batch(
+        cp.asarray(neuron_data['positions']),
+        cp.asarray(neuron_data['time_series']),
+        t_start, t_end,
+        (height, width),
+        z_plane
+    )
+    neuron_frames_norm = normalize_frames_batch(neuron_frames)
+    
+    # Create spike frames if available
+    if spikes is not None:
+        spike_frames = create_spike_frames_batch(
+            cp.asarray(neuron_data['positions']),
+            cp.asarray(spikes),
+            t_start, t_end,
+            (height, width),
+            z_plane
+        )
+        spike_frames_norm = normalize_frames_batch(spike_frames)
+    else:
+        spike_frames_norm = cp.zeros((batch_size, height, width), dtype=cp.uint8)
+    
+    # Process each frame in the batch
+    for b in range(batch_size):
+        # Create comparison frame (on CPU since we need to use OpenCV)
+        video_height = height * 2 + 10
+        video_width = width * 2 + 10
+        comparison = np.zeros((video_height, video_width), dtype=np.uint8)
+        
+        # Transfer normalized frames to CPU and compose the layout
+        comparison[:height, :width] = gpu_to_cpu(original_norm[b])
+        comparison[:height, -width:] = gpu_to_cpu(neuron_frames_norm[b])
+        comparison[-height:, -width:] = gpu_to_cpu(spike_frames_norm[b])
+        
+        # Convert to RGB for adding colored text
+        comparison_rgb = cv2.cvtColor(comparison, cv2.COLOR_GRAY2BGR)
+        
+        # Add labels
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.5
+        font_thickness = 1
+        
+        cv2.putText(comparison_rgb, 'Original', (10, 20), font, font_scale, (0,255,0), font_thickness)
+        cv2.putText(comparison_rgb, 'Detected Neurons', (width+20, 20), font, font_scale, (255,0,0), font_thickness)
+        cv2.putText(comparison_rgb, 'Spike Activity', (width+20, height+30), font, font_scale, (0,0,255), font_thickness)
+        
+        # Add timestamp
+        time_str = f"Time: {t_start+b}/{neuron_data['time_series'].shape[1]}"
+        cv2.putText(comparison_rgb, time_str, (10, video_height-10), font, font_scale, (255,255,255), font_thickness)
+        
+        # Write frame
+        video_writer.write(comparison_rgb)
+    
+    # Clear GPU memory
+    del original_gpu, neuron_frames, spike_frames_norm
+    cp.get_default_memory_pool().free_all_blocks()
+
+def read_tiff_z_plane(volume_data, z_plane):
+    """Extract the specified z-plane from a memory-mapped volume.
+    
+    Parameters
+    ----------
+    volume_data : numpy.memmap
+        Memory-mapped 4D array (time, z, y, x)
+    z_plane : int
+        Z-plane to extract
+    """
+    logger.info(f"Extracting z-plane {z_plane} from volume data")
+    
+    # Extract z-plane data
+    z_plane_data = volume_data[:, z_plane, :, :]
+    
+    # Ensure data is float32 and normalized to a reasonable range
+    z_plane_data = z_plane_data.astype(np.float32)
+    
+    # Normalize each frame individually to preserve temporal dynamics
+    min_vals = z_plane_data.min(axis=(1,2), keepdims=True)
+    max_vals = z_plane_data.max(axis=(1,2), keepdims=True)
+    
+    # Avoid division by zero
+    denom = np.maximum(max_vals - min_vals, 1e-10)
+    z_plane_data = (z_plane_data - min_vals) * (255.0 / denom)
+    
+    logger.info(f"Loaded z-plane data with shape: {z_plane_data.shape}")
+    return z_plane_data
+
+def generate_comparison_video(volume_data, neuron_data, config):
+    """Generate comparison video with original data and neuron detection+spikes.
+    
+    Parameters
+    ----------
+    volume_data : numpy.memmap
+        Memory-mapped 4D array (time, z, y, x)
+    neuron_data : dict
+        Dictionary containing neuron positions and time series
+    config : dict
+        Configuration dictionary
+    """
     logger.info("Generating comparison video")
     video = None
     
@@ -66,111 +310,92 @@ def generate_comparison_video(volume, neuron_data, config):
         z_plane = config['diagnostics']['z_plane']
         fps = config['diagnostics']['video_fps']
         codec = config['diagnostics']['video_codec']
-        output_path = Path(config['output']['base_dir']) / config['diagnostics']['video_filename']
+        output_path = Path(config['output']['base_dir']) / "diagnostic_comparison_video.avi"
+        
+        # Get optional max_frames parameter
+        max_frames = config['diagnostics'].get('max_frames', None)
+        
+        # Load spike data if available
+        spike_path = Path(config['output']['base_dir']) / 'spike_neuron_data.h5'
+        if spike_path.exists():
+            logger.info("Loading spike data for visualization")
+            with h5py.File(spike_path, 'r') as f:
+                spikes = f['neurons/spikes'][()]
+        else:
+            logger.warning("No spike data found, video will only show original and reconstructed data")
+            spikes = None
         
         # Ensure output directory exists
         output_path.parent.mkdir(parents=True, exist_ok=True)
         
-        # Get volume dimensions
-        time_points, z_slices, height, width = volume.shape
+        # Read only the required z-plane
+        z_plane_data = read_tiff_z_plane(volume_data, z_plane)
+        time_points, height, width = z_plane_data.shape
         
-        # Calculate chunk size based on available GPU memory
-        total_memory = cp.cuda.runtime.memGetInfo()[1]
-        bytes_per_pixel = np.dtype(volume.dtype).itemsize
+        # Limit number of frames if max_frames is set
+        if max_frames is not None:
+            time_points = min(time_points, max_frames)
+            z_plane_data = z_plane_data[:time_points]
+            logger.info(f"Limiting video to first {time_points} frames")
         
-        # Calculate memory needed per frame:
-        # 1. Original frame (height × width)
-        # 2. Reconstructed frame (height × width)
-        # 3. Comparison frame (height × (2×width + 10) × 3 channels)
-        # 4. Temporary arrays for processing
+        # Calculate batch size based on available GPU memory
+        total_memory = cp.cuda.runtime.memGetInfo()[0]
+        bytes_per_pixel = np.dtype(z_plane_data.dtype).itemsize
+        
+        # Memory needed per frame:
+        # 1. Original frame
+        # 2. Reconstructed frame
+        # 3. Spike frame
+        # 4. RGB output frame
+        # Plus overhead for processing
         memory_per_frame = bytes_per_pixel * (
-            height * width +  # Original frame
-            height * width +  # Reconstructed frame
-            height * (2 * width + 10) * 3 +  # RGB comparison frame
-            height * width * 2  # Processing overhead
+            height * width +  # Original
+            height * width +  # Reconstructed
+            height * width +  # Spikes
+            height * width * 3 +  # RGB output
+            height * width * 4  # Processing overhead
         )
         
-        # Use 20% of available memory
-        chunk_size = int(0.9 * total_memory / memory_per_frame)
-        chunk_size = max(1, min(chunk_size, time_points))  # Ensure valid chunk size
-        
-        logger.info(f"Processing video in chunks of {chunk_size} frames")
+        batch_size = int(0.5 * total_memory / memory_per_frame)
+        batch_size = max(1, batch_size) 
+        logger.info(f"Processing video in batches of {batch_size} frames")
         
         # Initialize video writer
         fourcc = cv2.VideoWriter_fourcc(*codec)
-        video_width = width * 2 + 10  # Space for two frames side by side with gap
-        video = cv2.VideoWriter(str(output_path), fourcc, fps, (video_width, height))
+        video_width = width * 2 + 10
+        video_height = height * 2 + 10
+        video = cv2.VideoWriter(str(output_path), fourcc, fps, (video_width, video_height))
         
         if not video.isOpened():
             raise RuntimeError(f"Failed to open video writer for {output_path}")
         
-        # Convert data to CPU if needed (one chunk at a time)
-        positions = gpu_to_cpu(neuron_data['positions'])
-        time_series = gpu_to_cpu(neuron_data['time_series'])
-        
-        # Process chunks of frames
-        for chunk_start in range(0, time_points, chunk_size):
-            chunk_end = min(chunk_start + chunk_size, time_points)
-            logger.info(f"Processing frames {chunk_start+1} to {chunk_end}/{time_points}")
+        # Process batches
+        for t_start in range(0, time_points, batch_size):
+            t_end = min(t_start + batch_size, time_points)
+            logger.info(f"Processing frames {t_start+1} to {t_end}/{time_points}")
             
-            # Get chunk of volume data
-            if isinstance(volume, cp.ndarray):
-                chunk_volume = gpu_to_cpu(volume[chunk_start:chunk_end, z_plane])
-            else:
-                chunk_volume = volume[chunk_start:chunk_end, z_plane]
+            # Get batch of frames
+            batch_data = z_plane_data[t_start:t_end]
             
-            # Process each frame in the chunk
-            for t in range(chunk_start, chunk_end):
-                frame_idx = t - chunk_start
-                
-                # Get original frame
-                original = chunk_volume[frame_idx]
-                original_norm = normalize_frame(original)
-                
-                # Create reconstructed frame from neuron data
-                reconstructed = create_neuron_frame(positions, time_series, t, (height, width), z_plane)
-                reconstructed_norm = normalize_frame(reconstructed)
-                
-                # Create side-by-side comparison
-                comparison = np.zeros((height, video_width), dtype=np.uint8)
-                comparison[:, :width] = original_norm
-                comparison[:, -width:] = reconstructed_norm
-                
-                # Convert to RGB for video
-                comparison_rgb = cv2.cvtColor(comparison, cv2.COLOR_GRAY2BGR)
-                
-                # Write frame
-                video.write(comparison_rgb)
-                
-                # Clear some memory
-                del comparison, comparison_rgb
-            
-            # Clear chunk memory
-            del chunk_volume
+            # Process batch
+            process_video_batch(
+                batch_data,
+                neuron_data,
+                spikes,
+                t_start,
+                t_end,
+                z_plane,
+                video
+            )
             
             # Force garbage collection
             import gc
             gc.collect()
-            
-            # Clear GPU memory
-            cp.get_default_memory_pool().free_all_blocks()
-        
-        # Properly close video writer
-        if video is not None:
-            video.release()
         
         logger.info(f"Video saved to: {output_path}")
         
-    except KeyboardInterrupt:
-        logger.warning("Video generation interrupted by user")
-        if video is not None:
-            video.release()
-        raise
-        
     except Exception as e:
         logger.error(f"Error generating comparison video: {str(e)}")
-        if video is not None:
-            video.release()
         raise
         
     finally:
@@ -178,7 +403,7 @@ def generate_comparison_video(volume, neuron_data, config):
         if video is not None:
             video.release()
 
-def log_system_state(self):
+def log_system_state():
     # Check for GPU errors
     try:
         gpu_errors = subprocess.check_output(['nvidia-smi', '-q', '-d', 'ERROR'], text=True, stderr=subprocess.DEVNULL)

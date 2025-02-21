@@ -15,6 +15,7 @@ from .io import read_tiff, write_results, save_registered_volume
 from .registration import register_volume
 from .detection import detect_neurons
 from .extraction import extract_time_series
+from .spike_detection import detect_spikes, write_spike_results
 from .diagnostics import generate_comparison_video
 
 class DiagnosticHandler:
@@ -246,6 +247,7 @@ def diagnostic_main():
             
             # Check for existing results
             results_path = Path(config['output']['base_dir']) / config['output']['results_file']
+            spike_results_path = Path(config['output']['base_dir']) / 'spike_neuron_data.h5'
             registered_path = reg_dir / "registered.tif"
             
             if results_path.exists() and registered_path.exists():
@@ -256,8 +258,21 @@ def diagnostic_main():
                         'time_series': f['neurons/time_series'][()],
                         'metadata': [{'z': p[0], 'y': p[1], 'x': p[2]} for p in f['neurons/positions'][()]]
                     }
+                # Load registered volume as memmap
                 registered_volume = read_tiff(str(registered_path), config)
                 handler.check_point("results_loaded")
+                
+                # Perform spike detection if not already done
+                if not spike_results_path.exists():
+                    handler.stage = "spike_detection"
+                    try:
+                        spike_results = detect_spikes(results, config)
+                        write_spike_results(spike_results, config)
+                        handler.check_point("spike_detection_complete")
+                    except Exception as e:
+                        logger.error(f"Spike detection failed: {str(e)}")
+                        handler.log_system_state()
+                        raise
             else:
                 # Read input TIFF file
                 handler.stage = "reading_input"
@@ -309,20 +324,22 @@ def diagnostic_main():
                 handler.stage = "saving_results"
                 write_results(results, config)
                 
-                # Free memory before video generation
-                del registered_volume
-                registered_volume = None
-                handler.check_point("video_generation")
+                # Perform spike detection
+                handler.stage = "spike_detection"
+                try:
+                    spike_results = detect_spikes(results, config)
+                    write_spike_results(spike_results, config)
+                    handler.check_point("spike_detection_complete")
+                except Exception as e:
+                    logger.error(f"Spike detection failed: {str(e)}")
+                    handler.log_system_state()
+                    raise
             
             # Generate comparison video if requested
             if config.get('diagnostics', {}).get('generate_video', True):
                 handler.stage = "video_generation"
                 try:
-                    # Load volume if needed
-                    if registered_volume is None:
-                        logger.info("Loading registered volume for video generation")
-                        registered_volume = read_tiff(str(registered_path), config)
-                    
+                    # Pass the memory-mapped array directly
                     generate_comparison_video(registered_volume, results, config)
                     logger.info("Video generation completed")
                     handler.check_point("complete")
