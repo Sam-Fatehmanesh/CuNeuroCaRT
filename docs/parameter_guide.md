@@ -172,11 +172,19 @@ gpu:
 
 ```yaml
 spike_detection:
-  decay_constant: 0.95
-  minimum_spike: 0.1
-  lambda: null
-  noise_std: 0.1
+  enabled: true          # Whether to perform spike detection
+  decay_constant: 0.95   # Calcium decay time constant (g)
+  minimum_spike: 0.1     # Minimum spike amplitude (smin)
+  lambda: null           # L1 sparsity penalty
+  noise_std: 0.1        # Noise standard deviation
 ```
+
+- **enabled**: Controls spike detection processing
+  - Range: true/false
+  - true: Perform spike detection
+  - false: Skip spike detection
+  - Affects diagnostic video generation
+  - Default: true
 
 - **decay_constant**: Calcium decay time constant (g)
   - Range: 0.8 to 0.98

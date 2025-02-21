@@ -188,6 +188,21 @@ def main():
             logger.info("Saving results")
             write_results(results, config)
             
+            # Perform spike detection if enabled
+            if config.get('spike_detection', {}).get('enabled', True):
+                logger.info("Performing spike detection")
+                try:
+                    spike_results = detect_spikes(results, config)
+                    write_spike_results(spike_results, config)
+                    logger.info("Spike detection completed")
+                except Exception as e:
+                    logger.error(f"Spike detection failed: {str(e)}")
+                    logger.log_system_state()
+                    raise
+            else:
+                logger.info("Spike detection disabled in config")
+                spike_results = None
+            
             # Free memory before video generation
             del registered_volume
             registered_volume = None
@@ -202,7 +217,7 @@ def main():
                     reg_dir = Path(config['output']['base_dir']) / config['output']['registered_dir']
                     registered_volume = read_tiff(str(reg_dir / "registered.tif"), config)
                 
-                generate_comparison_video(registered_volume, results, config)
+                generate_comparison_video(registered_volume, results, config, spike_results)
                 logger.info("Video generation completed")
             except KeyboardInterrupt:
                 logger.warning("Video generation interrupted.")
@@ -324,29 +339,33 @@ def diagnostic_main():
                 handler.stage = "saving_results"
                 write_results(results, config)
                 
-                # Perform spike detection
-                handler.stage = "spike_detection"
-                try:
-                    spike_results = detect_spikes(results, config)
-                    write_spike_results(spike_results, config)
-                    handler.check_point("spike_detection_complete")
-                except Exception as e:
-                    logger.error(f"Spike detection failed: {str(e)}")
-                    handler.log_system_state()
-                    raise
-            
-            # Generate comparison video if requested
-            if config.get('diagnostics', {}).get('generate_video', True):
-                handler.stage = "video_generation"
-                try:
-                    # Pass the memory-mapped array directly
-                    generate_comparison_video(registered_volume, results, config)
-                    logger.info("Video generation completed")
-                    handler.check_point("complete")
-                except Exception as e:
-                    logger.error(f"Video generation failed: {str(e)}")
-                    handler.log_system_state()
-                    raise
+                # Perform spike detection if enabled
+                if config.get('spike_detection', {}).get('enabled', True):
+                    handler.stage = "spike_detection"
+                    try:
+                        spike_results = detect_spikes(results, config)
+                        write_spike_results(spike_results, config)
+                        handler.check_point("spike_detection_complete")
+                    except Exception as e:
+                        logger.error(f"Spike detection failed: {str(e)}")
+                        handler.log_system_state()
+                        raise
+                else:
+                    logger.info("Spike detection disabled in config")
+                    spike_results = None
+                
+                # Generate comparison video if requested
+                if config.get('diagnostics', {}).get('generate_video', True):
+                    handler.stage = "video_generation"
+                    try:
+                        # Pass the memory-mapped array directly
+                        generate_comparison_video(registered_volume, results, config, spike_results)
+                        logger.info("Video generation completed")
+                        handler.check_point("complete")
+                    except Exception as e:
+                        logger.error(f"Video generation failed: {str(e)}")
+                        handler.log_system_state()
+                        raise
             
             logger.info("Pipeline completed successfully")
             

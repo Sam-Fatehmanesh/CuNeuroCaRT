@@ -196,70 +196,40 @@ def create_spike_frames_batch(positions, spikes, t_start, t_end, shape, z_plane)
     return frames
 
 def process_video_batch(original_batch, neuron_data, spikes, t_start, t_end, z_plane, video_writer):
-    """Process a batch of frames for video generation."""
-    batch_size, height, width = original_batch.shape
-    
-    # Move batch to GPU and normalize
-    original_gpu = cp.asarray(original_batch)
-    original_norm = normalize_frames_batch(original_gpu)
+    """Process a batch of frames for the comparison video."""
+    # Get parameters
+    positions = neuron_data['positions']
+    time_series = neuron_data['time_series']
     
     # Create neuron visualization frames
-    neuron_frames = create_neuron_frames_batch(
-        cp.asarray(neuron_data['positions']),
-        cp.asarray(neuron_data['time_series']),
-        t_start, t_end,
-        (height, width),
-        z_plane
-    )
-    neuron_frames_norm = normalize_frames_batch(neuron_frames)
+    neuron_frames = create_neuron_frames_batch(positions, time_series, t_start, t_end, original_batch.shape[1:], z_plane)
     
-    # Create spike frames if available
+    # Create spike visualization frames if spikes are available
     if spikes is not None:
-        spike_frames = create_spike_frames_batch(
-            cp.asarray(neuron_data['positions']),
-            cp.asarray(spikes),
-            t_start, t_end,
-            (height, width),
-            z_plane
-        )
-        spike_frames_norm = normalize_frames_batch(spike_frames)
+        spike_frames = create_spike_frames_batch(positions, spikes['spikes'], t_start, t_end, original_batch.shape[1:], z_plane)
     else:
-        spike_frames_norm = cp.zeros((batch_size, height, width), dtype=cp.uint8)
+        # Create blank frames if no spikes
+        spike_frames = np.zeros_like(original_batch)
     
     # Process each frame in the batch
-    for b in range(batch_size):
-        # Create comparison frame (on CPU since we need to use OpenCV)
-        video_height = height * 2 + 10
-        video_width = width * 2 + 10
-        comparison = np.zeros((video_height, video_width), dtype=np.uint8)
+    for i in range(len(original_batch)):
+        # Create 2x2 grid
+        frame = np.zeros((original_batch.shape[1]*2, original_batch.shape[2]*2), dtype=np.uint8)
         
-        # Transfer normalized frames to CPU and compose the layout
-        comparison[:height, :width] = gpu_to_cpu(original_norm[b])
-        comparison[:height, -width:] = gpu_to_cpu(neuron_frames_norm[b])
-        comparison[-height:, -width:] = gpu_to_cpu(spike_frames_norm[b])
+        # Top left: Original
+        frame[:original_batch.shape[1], :original_batch.shape[2]] = normalize_frames_batch(original_batch[i])
         
-        # Convert to RGB for adding colored text
-        comparison_rgb = cv2.cvtColor(comparison, cv2.COLOR_GRAY2BGR)
+        # Top right: Neurons
+        frame[:original_batch.shape[1], original_batch.shape[2]:] = neuron_frames[i]
         
-        # Add labels
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale = 0.5
-        font_thickness = 1
+        # Bottom right: Spikes (if available)
+        frame[original_batch.shape[1]:, original_batch.shape[2]:] = spike_frames[i]
         
-        cv2.putText(comparison_rgb, 'Original', (10, 20), font, font_scale, (0,255,0), font_thickness)
-        cv2.putText(comparison_rgb, 'Detected Neurons', (width+20, 20), font, font_scale, (255,0,0), font_thickness)
-        cv2.putText(comparison_rgb, 'Spike Activity', (width+20, height+30), font, font_scale, (0,0,255), font_thickness)
-        
-        # Add timestamp
-        time_str = f"Time: {t_start+b}/{neuron_data['time_series'].shape[1]}"
-        cv2.putText(comparison_rgb, time_str, (10, video_height-10), font, font_scale, (255,255,255), font_thickness)
+        # Add frame counter
+        cv2.putText(frame, f"Frame {t_start+i}", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, 255, 1)
         
         # Write frame
-        video_writer.write(comparison_rgb)
-    
-    # Clear GPU memory
-    del original_gpu, neuron_frames, spike_frames_norm
-    cp.get_default_memory_pool().free_all_blocks()
+        video_writer.write(frame)
 
 def read_tiff_z_plane(volume_data, z_plane):
     """Extract the specified z-plane from a memory-mapped volume.
@@ -290,123 +260,76 @@ def read_tiff_z_plane(volume_data, z_plane):
     logger.info(f"Loaded z-plane data with shape: {z_plane_data.shape}")
     return z_plane_data
 
-def generate_comparison_video(volume_data, neuron_data, config):
-    """Generate comparison video with original data and neuron detection+spikes.
+def generate_comparison_video(volume_data, neuron_data, config, spike_results=None):
+    """Generate comparison video showing original data, detected neurons, and spikes.
     
     Parameters
     ----------
-    volume_data : numpy.memmap
-        Memory-mapped 4D array (time, z, y, x)
+    volume_data : numpy.ndarray
+        4D array (time, z, y, x)
     neuron_data : dict
         Dictionary containing neuron positions and time series
     config : dict
-        Configuration dictionary containing mandatory 'generate_video' parameter
+        Configuration dictionary
+    spike_results : dict, optional
+        Dictionary containing spike detection results. If None, spike visualization will be disabled.
     """
-    # Check if video generation is enabled
-    if not config['diagnostics'].get('generate_video', False):
-        logger.info("Video generation is disabled in config")
-        return
-        
     logger.info("Generating comparison video")
-    video = None
+    
+    # Get parameters
+    z_plane = config['diagnostics']['z_plane']
+    fps = config['diagnostics'].get('video_fps', 10)
+    codec = config['diagnostics'].get('video_codec', 'XVID')
+    video_filename = config['diagnostics'].get('video_filename', 'diagnostic_comparison_video.avi')
+    max_frames = config['diagnostics'].get('max_frames', None)
+    
+    # Get output path
+    output_dir = Path(config['output']['base_dir'])
+    video_path = output_dir / video_filename
+    
+    # Get dimensions
+    time_points = volume_data.shape[0]
+    height = volume_data.shape[2]
+    width = volume_data.shape[3]
+    
+    # Limit frames if requested
+    if max_frames is not None:
+        time_points = min(time_points, max_frames)
+        logger.info(f"Limiting video to first {time_points} frames")
     
     try:
-        # Get parameters
-        z_plane = config['diagnostics']['z_plane']
-        fps = config['diagnostics']['video_fps']
-        codec = config['diagnostics']['video_codec']
-        output_path = Path(config['output']['base_dir']) / "diagnostic_comparison_video.avi"
-        
-        # Get optional max_frames parameter
-        max_frames = config['diagnostics'].get('max_frames', None)
-        
-        # Load spike data if available
-        spike_path = Path(config['output']['base_dir']) / 'spike_neuron_data.h5'
-        if spike_path.exists():
-            logger.info("Loading spike data for visualization")
-            with h5py.File(spike_path, 'r') as f:
-                spikes = f['neurons/spikes'][()]
-        else:
-            logger.warning("No spike data found, video will only show original and reconstructed data")
-            spikes = None
-        
-        # Ensure output directory exists
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        # Read only the required z-plane
-        z_plane_data = read_tiff_z_plane(volume_data, z_plane)
-        time_points, height, width = z_plane_data.shape
-        
-        # Limit number of frames if max_frames is set
-        if max_frames is not None:
-            time_points = min(time_points, max_frames)
-            z_plane_data = z_plane_data[:time_points]
-            logger.info(f"Limiting video to first {time_points} frames")
-        
-        # Calculate batch size based on available GPU memory
-        total_memory = cp.cuda.runtime.memGetInfo()[0]
-        bytes_per_pixel = np.dtype(z_plane_data.dtype).itemsize
-        
-        # Memory needed per frame:
-        # 1. Original frame
-        # 2. Reconstructed frame
-        # 3. Spike frame
-        # 4. RGB output frame
-        # Plus overhead for processing
-        memory_per_frame = bytes_per_pixel * (
-            height * width +  # Original
-            height * width +  # Reconstructed
-            height * width +  # Spikes
-            height * width * 3 +  # RGB output
-            height * width * 4  # Processing overhead
-        )
-        
-        batch_size = int(0.5 * total_memory / memory_per_frame)
-        batch_size = max(1, min(batch_size, time_points)) 
-        logger.info(f"Processing video in batches of {batch_size} frames")
-        
-        # Initialize video writer
+        # Create video writer
         fourcc = cv2.VideoWriter_fourcc(*codec)
-        video_width = width * 2 + 10
-        video_height = height * 2 + 10
-        video = cv2.VideoWriter(str(output_path), fourcc, fps, (video_width, video_height))
+        video_writer = cv2.VideoWriter(str(video_path), fourcc, fps, (width*2, height*2), False)
         
-        if not video.isOpened():
-            raise RuntimeError(f"Failed to open video writer for {output_path}")
-        
-        # Process batches
+        # Process in batches
+        batch_size = 100  # Adjust based on memory constraints
         for t_start in range(0, time_points, batch_size):
             t_end = min(t_start + batch_size, time_points)
-            logger.info(f"Processing frames {t_start+1} to {t_end}/{time_points}")
+            logger.debug(f"Processing frames {t_start} to {t_end}")
             
-            # Get batch of frames
-            batch_data = z_plane_data[t_start:t_end]
+            # Get batch of original frames
+            z_plane_data = read_tiff_z_plane(volume_data, z_plane)
+            original_batch = z_plane_data[t_start:t_end]
             
             # Process batch
-            process_video_batch(
-                batch_data,
-                neuron_data,
-                spikes,
-                t_start,
-                t_end,
-                z_plane,
-                video
-            )
+            process_video_batch(original_batch, neuron_data, spike_results, t_start, t_end, z_plane, video_writer)
             
-            # Force garbage collection
-            import gc
-            gc.collect()
+            # Log progress
+            if t_end - t_start < batch_size:
+                logger.info(f"Processed final batch: frames {t_start} to {t_end}")
+            elif t_start == 0:
+                logger.info(f"Processing in batches of {batch_size} frames")
         
-        logger.info(f"Video saved to: {output_path}")
+        # Release video writer
+        video_writer.release()
+        logger.info(f"Video saved to: {video_path}")
         
     except Exception as e:
-        logger.error(f"Error generating comparison video: {str(e)}")
+        logger.error(f"Error generating video: {str(e)}")
+        if 'video_writer' in locals():
+            video_writer.release()
         raise
-        
-    finally:
-        # Ensure video writer is always closed
-        if video is not None:
-            video.release()
 
 def log_system_state():
     # Check for GPU errors
