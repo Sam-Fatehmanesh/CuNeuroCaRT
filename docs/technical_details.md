@@ -106,58 +106,82 @@ The registration process uses phase correlation to detect shifts between frames:
    - Handles both L1 penalty and hard threshold approaches
    - Implementation based on Friedrich et al. (2017) [1]
 
-2. **Parameters**:
+2. **GPU Implementation**:
+   - Parallel processing of neurons using CUDA
+   - One block per neuron, one thread per block
+   - Memory-efficient pool management:
+     ```
+     Global Memory:
+     ├── Pool Buffer (per neuron)
+     │   ├── v_pool[T]      # Pool values
+     │   ├── w_pool[T]      # Pool weights
+     │   ├── start_idx[T]   # Pool start indices
+     │   └── pool_length[T] # Pool lengths
+     ```
+   - Dynamic pool merging to prevent memory overflow
+   - Automatic lambda optimization using pilot neurons
+
+3. **Parameters**:
    ```yaml
    spike_detection:
      decay_constant: 0.95  # Calcium decay time constant (g)
      minimum_spike: 0.1    # Minimum spike amplitude (smin)
-     lambda: null          # L1 sparsity penalty
+     lambda: null          # L1 sparsity penalty (auto-optimized)
      noise_std: 0.1       # For lambda optimization
    ```
 
-3. **Processing Steps**:
+4. **Processing Steps**:
    - Trace normalization
-   - Pool-based deconvolution
-   - Automatic parameter optimization
-   - Binary spike inference
-
-### Implementation Details
-1. **Data Preprocessing**:
-   ```python
-   # Normalize each trace
-   trace_mean = np.mean(trace)
-   trace_std = np.std(trace)
-   trace = (trace - trace_mean) / trace_std
-   ```
-
-2. **Deconvolution**:
-   - Uses pool-based algorithm for efficiency
-   - Handles non-negativity constraints
-   - Optimizes sparsity penalty automatically
-
-3. **Output Format**:
-   ```
-   spike_neuron_data.h5
-   ├── neurons/
-       ├── positions              # (N, 3) array
-       ├── time_series           # (N, T) raw traces
-       ├── denoised_time_series  # (N, T) denoised
-       ├── spikes               # (N, T) binary spikes
-       └── attributes
-           ├── total_neurons
-           └── time_points
-   ```
+   - Lambda determination from pilot neurons
+   - Parallel OASIS processing on GPU
+   - Binary spike train generation
+   - Denormalization of denoised traces
 
 ### Memory Management
-1. **CPU Processing**:
-   - Processes one neuron at a time
-   - Minimizes memory footprint
-   - Efficient array operations
+1. **Global Memory Usage**:
+   - Pool data stored in global memory buffer
+   - 4 arrays per neuron (values, weights, indices, lengths)
+   - Buffer size: n_neurons × n_timepoints × 4
 
-2. **Storage**:
-   - HDF5 format for efficient I/O
-   - Compressed data storage
-   - Metadata preservation
+2. **Shared Memory Usage**:
+   - Small buffer (128 doubles) for temporary calculations
+   - Single counter for active pools
+   - Minimized to stay within hardware limits
+
+3. **Pool Management**:
+   - Dynamic merging of pools when count approaches limit
+   - Oldest pools merged first to maintain memory efficiency
+   - Automatic handling of long time series
+
+### Performance Considerations
+1. **GPU Optimization**:
+   - Coalesced memory access patterns
+   - Minimal thread divergence
+   - Efficient pool merging strategy
+   - Balanced memory usage vs speed
+
+2. **Scalability**:
+   - Handles arbitrary length time series
+   - Automatic memory management
+   - Parallel processing of multiple neurons
+
+3. **Precision**:
+   - Double precision for numerical stability
+   - Careful handling of exponential terms
+   - Robust spike threshold determination
+
+### Output Format
+```
+spike_neuron_data.h5
+├── neurons/
+    ├── positions              # (N, 3) array
+    ├── time_series           # (N, T) raw traces
+    ├── denoised_time_series  # (N, T) denoised
+    ├── spikes               # (N, T) binary spikes
+    └── attributes
+        ├── total_neurons
+        └── time_points
+```
 
 ## 5. Diagnostics
 

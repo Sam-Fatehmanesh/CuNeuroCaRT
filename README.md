@@ -17,11 +17,12 @@ A high-performance, GPU-accelerated pipeline for processing 3D brain calcium ima
 - Processes large 4D datasets (time × z-planes × height × width)
 - Dynamic GPU memory management for optimal performance
 - Parallel processing of multiple z-planes and time points
+- Memory-efficient spike detection with dynamic pool management
 - Typical speedup: 5-10x faster than CPU implementations
 
 ## Requirements
 
-- CUDA-capable NVIDIA GPU
+- CUDA-capable NVIDIA GPU with compute capability 6.0+
 - CUDA 11.x or later
 - Anaconda or Miniconda
 - Python 3.8+
@@ -63,9 +64,11 @@ A high-performance, GPU-accelerated pipeline for processing 3D brain calcium ima
    - Size and brightness filtering
 
 3. **Spike Detection** ⚡
-   - OASIS deconvolution algorithm
-   - Automatic parameter optimization
-   - Binary spike train inference
+   - GPU-accelerated OASIS algorithm
+   - Parallel neuron processing
+   - Dynamic pool management
+   - Automatic lambda optimization
+   - Memory-efficient implementation
 
 4. **Time Series Extraction** 📈
    - Signal extraction from detected neurons
