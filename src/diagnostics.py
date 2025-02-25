@@ -12,6 +12,11 @@ logger = logging.getLogger(__name__)
 
 def normalize_frames_batch(frames):
     """Normalize a batch of frames to 0-255 range on GPU."""
+    # Ensure input is on GPU and has correct shape
+    frames = cp.asarray(frames)
+    if frames.ndim == 2:
+        frames = frames[None, ...]
+    
     # Compute min/max across spatial dimensions but keep batch dimension
     frame_min = cp.min(frames, axis=(1, 2), keepdims=True)
     frame_max = cp.max(frames, axis=(1, 2), keepdims=True)
@@ -39,6 +44,10 @@ def create_neuron_frames_batch(positions, time_series, t_start, t_end, shape, z_
     """Create frames showing neuron activities for a batch of time points using vectorized operations."""
     height, width = shape
     batch_size = t_end - t_start
+    
+    # Convert inputs to CuPy arrays if they aren't already
+    positions = cp.asarray(positions)
+    time_series = cp.asarray(time_series)
     
     # Filter neurons in this z-plane
     z_mask = positions[:, 0] == z_plane
@@ -125,6 +134,10 @@ def create_spike_frames_batch(positions, spikes, t_start, t_end, shape, z_plane)
     height, width = shape
     batch_size = t_end - t_start
     
+    # Convert inputs to CuPy arrays if they aren't already
+    positions = cp.asarray(positions)
+    spikes = cp.asarray(spikes)
+    
     # Filter neurons in this z-plane
     z_mask = positions[:, 0] == z_plane
     if not cp.any(z_mask):
@@ -197,19 +210,22 @@ def create_spike_frames_batch(positions, spikes, t_start, t_end, shape, z_plane)
 
 def process_video_batch(original_batch, neuron_data, spikes, t_start, t_end, z_plane, video_writer):
     """Process a batch of frames for the comparison video."""
-    # Get parameters
-    positions = neuron_data['positions']
-    time_series = neuron_data['time_series']
+    # Get parameters and ensure they're on GPU
+    positions = cp.asarray(neuron_data['positions'])
+    time_series = cp.asarray(neuron_data['time_series'])
+    
+    # Convert original batch to GPU if needed
+    original_batch_gpu = cp.asarray(original_batch)
     
     # Create neuron visualization frames
     neuron_frames = create_neuron_frames_batch(positions, time_series, t_start, t_end, original_batch.shape[1:], z_plane)
     
     # Create spike visualization frames if spikes are available
-    if spikes is not None:
+    if spikes is not None and 'spikes' in spikes:
         spike_frames = create_spike_frames_batch(positions, spikes['spikes'], t_start, t_end, original_batch.shape[1:], z_plane)
     else:
         # Create blank frames if no spikes
-        spike_frames = np.zeros_like(original_batch)
+        spike_frames = cp.zeros_like(original_batch_gpu)
     
     # Process each frame in the batch
     for i in range(len(original_batch)):
@@ -217,19 +233,23 @@ def process_video_batch(original_batch, neuron_data, spikes, t_start, t_end, z_p
         frame = np.zeros((original_batch.shape[1]*2, original_batch.shape[2]*2), dtype=np.uint8)
         
         # Top left: Original
-        frame[:original_batch.shape[1], :original_batch.shape[2]] = normalize_frames_batch(original_batch[i])
+        frame[:original_batch.shape[1], :original_batch.shape[2]] = cp.asnumpy(normalize_frames_batch(original_batch_gpu[i:i+1])[0])
         
         # Top right: Neurons
-        frame[:original_batch.shape[1], original_batch.shape[2]:] = neuron_frames[i]
+        frame[:original_batch.shape[1], original_batch.shape[2]:] = cp.asnumpy(neuron_frames[i])
         
         # Bottom right: Spikes (if available)
-        frame[original_batch.shape[1]:, original_batch.shape[2]:] = spike_frames[i]
+        frame[original_batch.shape[1]:, original_batch.shape[2]:] = cp.asnumpy(spike_frames[i])
         
         # Add frame counter
         cv2.putText(frame, f"Frame {t_start+i}", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, 255, 1)
         
         # Write frame
         video_writer.write(frame)
+    
+    # Clean up GPU memory
+    del original_batch_gpu, neuron_frames, spike_frames
+    cp.get_default_memory_pool().free_all_blocks()
 
 def read_tiff_z_plane(volume_data, z_plane):
     """Extract the specified z-plane from a memory-mapped volume.
